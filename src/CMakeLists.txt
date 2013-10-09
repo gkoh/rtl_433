@@ -66,52 +66,15 @@ endif()
 ########################################################################
 # Build utility
 ########################################################################
-add_executable(rtl_sdr rtl_sdr.c)
-add_executable(rtl_tcp rtl_tcp.c)
-add_executable(rtl_test rtl_test.c)
-add_executable(rtl_fm rtl_fm.c)
-add_executable(rtl_eeprom rtl_eeprom.c)
-add_executable(rtl_adsb rtl_adsb.c)
 add_executable(rtl_433 rtl_433.c)
-set(INSTALL_TARGETS rtlsdr_shared rtlsdr_static rtl_sdr rtl_tcp rtl_test rtl_fm rtl_eeprom rtl_adsb rtl_433)
+set(INSTALL_TARGETS rtl_433)
 
-target_link_libraries(rtl_sdr rtlsdr_shared
-    ${LIBUSB_LIBRARIES}
-    ${CMAKE_THREAD_LIBS_INIT}
-)
-target_link_libraries(rtl_tcp rtlsdr_shared
-    ${LIBUSB_LIBRARIES}
-    ${CMAKE_THREAD_LIBS_INIT}
-)
-target_link_libraries(rtl_test rtlsdr_shared
-    ${LIBUSB_LIBRARIES}
-    ${CMAKE_THREAD_LIBS_INIT}
-)
-target_link_libraries(rtl_fm rtlsdr_shared
-    ${LIBUSB_LIBRARIES}
-    ${CMAKE_THREAD_LIBS_INIT}
-)
 target_link_libraries(rtl_433 rtlsdr_shared
     ${LIBUSB_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}
 )
-target_link_libraries(rtl_eeprom rtlsdr_shared
-    ${LIBUSB_LIBRARIES}
-    ${CMAKE_THREAD_LIBS_INIT}
-)
-target_link_libraries(rtl_adsb rtlsdr_shared
-    ${LIBUSB_LIBRARIES}
-    ${CMAKE_THREAD_LIBS_INIT}
-)
 if(UNIX)
-target_link_libraries(rtl_fm m)
 target_link_libraries(rtl_433 m)
-target_link_libraries(rtl_adsb m)
-if(APPLE)
-    target_link_libraries(rtl_test m)
-else()
-    target_link_libraries(rtl_test m rt)
-endif()
 endif()
 
 if(WIN32)

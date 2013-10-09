@@ -61,7 +61,10 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
+#include <inttypes.h>
 #include <time.h>
+#include <math.h>
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -115,6 +118,7 @@ typedef struct {
     unsigned int    short_limit;
     unsigned int    long_limit;
     unsigned int    reset_limit;
+    bool            sync_bit;
     int     (*json_callback)(uint8_t bits_buffer[BITBUF_ROWS][BITBUF_COLS]) ;
 } r_device;
 
@@ -262,6 +266,208 @@ static int waveman_callback(uint8_t bb[BITBUF_ROWS][BITBUF_COLS]) {
     return 0;
 }
 
+/**
+ * Adapted Dallas 1-wire CRC8 checksum.
+ *
+ * Adopted from:
+ * https://github.com/lucsmall/BetterWH2
+ */
+
+static uint8_t crc8 (uint8_t *addr, uint8_t len)
+{
+    uint8_t crc = 0;
+
+    // Indicated changes are from reference CRC-8 function in OneWire library
+    while (len--) {
+        uint8_t inbyte = *addr++;
+        uint8_t i;
+        for (i = 8; i; i--) {
+            uint8_t mix = (crc ^ inbyte) & 0x80; // changed from & 0x01
+            crc <<= 1; // changed from right shift
+            if (mix) crc ^= 0x31;// changed from 0x8C;
+            inbyte <<= 1; // changed from right shift
+        }
+    }
+    return crc;
+}
+
+/** WH3081 full packet length in bytes. */
+#define WH3081_PACKET_LENGTH   12
+
+/** WH3081 payload length in bytes. */
+#define WH3081_PAYLOAD_LENGTH  10
+
+/** WH3081 offset of preamble. */
+#define WH3081_PREAMBLE 0
+
+/** WH3081 offset of postamble. */
+#define WH3081_POSTAMBLE 11
+
+/** WH3081 offset of payload. */
+#define WH3081_PAYLOAD  1
+
+/** WH3081 offset of CRC8. */
+#define WH3081_CRC8    10
+
+/** WH3081 message type. */
+#define WH3081_MESSAGE_TYPE(b) ((b[WH3081_PAYLOAD] >> 4) & 0x0F)
+
+/** WH3081 station ID. */
+#define WH3081_STATION_ID(b) \
+    (((b[WH3081_PAYLOAD] << 4) & 0xF0) | ((b[WH3081_PAYLOAD+1] >> 4) & 0x0F))
+
+/** WH3081 temperature. */
+#define WH3081_TEMPERATURE(b) \
+    (((((b[WH3081_PAYLOAD+1] << 8) & 0x0F00) | b[WH3081_PAYLOAD+2]) - 400)/10.0f)
+
+/** WH3081 humidity. */
+#define WH3081_HUMIDITY(b) \
+    (b[WH3081_PAYLOAD+3] & 0x7F)
+
+/** WH3081 wind speed. */
+#define WH3081_WIND_SPEED(b) \
+    (roundf((b[WH3081_PAYLOAD+4] & 0xFF) * 34.0f) * 3.6 / 100)
+
+/** WH3081 wind gust. */
+#define WH3081_WIND_GUST(b) \
+    (roundf((b[WH3081_PAYLOAD+5] & 0xFF) * 34.0f) * 3.6 / 100)
+
+/** WH3081 wind direction. */
+#define WH3081_WIND_DIRECTION(b) \
+    ((b[WH3081_PAYLOAD+8] & 0x0F) * 22.5f)
+
+/** WH3081 rainfall. */
+#define WH3081_RAINFALL(b) \
+    ((((b[WH3081_PAYLOAD+6] << 8) & 0x0F00) | b[WH3081_PAYLOAD+7]) * 0.3)
+
+/** WH3081 status. */
+#define WH3081_STATUS(b) \
+    ((b[WH3081_PAYLOAD+8] >> 4) & 0x0F)
+
+/** WH3081 status - battery low. */
+#define WH3081_STATUS_BATTERY 0x01
+
+
+static int wh3081_callback(uint8_t bb[BITBUF_ROWS][BITBUF_COLS]) {
+    unsigned int i = 0;
+    uint8_t packet[WH3081_PACKET_LENGTH] = { 0x0 };
+    uint64_t epoch;
+
+    for (i = 0; i < sizeof(packet); i++) {
+        packet[i] = ~bb[0][i];
+    }
+
+    epoch = (uint64_t)time(NULL);
+
+    /* Check preamble, 8 bits of 1's. */
+    if (packet[WH3081_PREAMBLE] != 0xFF) {
+        return 0;
+    }
+
+    /* Check postamble, 8 bits of 1's. */
+    if (packet[WH3081_POSTAMBLE] != 0xFF) {
+        return 0;
+    }
+
+    /* Check CRC8. */
+    if (crc8(&packet[WH3081_PAYLOAD], WH3081_PAYLOAD_LENGTH) != 0x00) {
+        return 0;
+    }
+
+    fprintf(stderr, "CRC OK: %"PRIu64"\n", epoch);
+
+    /* Check message type is correct, 0x0A. */
+    if (WH3081_MESSAGE_TYPE(packet) != 0x0A) {
+        return 0;
+    }
+
+    /* Check status is valid, low battery OK. */
+    if ((WH3081_STATUS(packet) & ~WH3081_STATUS_BATTERY) != 0x0) {
+        fprintf(stderr, "   Status: 0x%X\n", WH3081_STATUS(packet));
+        return 0;
+    }
+
+    for (i = 0; i < WH3081_PACKET_LENGTH; i++) {
+        fprintf(stderr, "0x%02X ", packet[i]);
+    }
+    fprintf(stderr, "\n");
+
+    fprintf(stderr, "   Message Type: 0x%02X\n", WH3081_MESSAGE_TYPE(packet));
+    fprintf(stderr, "   Station ID: 0x%02X\n", WH3081_STATION_ID(packet));
+    fprintf(stderr, "   Temperature: %.2f\n", WH3081_TEMPERATURE(packet));
+    fprintf(stderr, "   Humidity: %u\n", WH3081_HUMIDITY(packet));
+    fprintf(stderr, "   Wind Speed: %.1f\n", WH3081_WIND_SPEED(packet));
+    fprintf(stderr, "   Wind Gust: %.1f\n", WH3081_WIND_GUST(packet));
+    fprintf(stderr, "   Wind Direction: %.1f\n", WH3081_WIND_DIRECTION(packet));
+    fprintf(stderr, "   Rainfall: %.1f\n", WH3081_RAINFALL(packet));
+    fprintf(stderr, "   Status: 0x%X\n", WH3081_STATUS(packet));
+
+    return 1;
+}
+
+/** WH3081 Lux packet length in bytes. */
+#define WH3081_LUX_PACKET_LENGTH 9
+
+/** WH3081 Lux offset of postamble. */
+#define WH3081_LUX_POSTAMBLE 8
+
+/** WH3081 Lux packet length in bytes. */
+#define WH3081_LUX_PAYLOAD_LENGTH 7
+
+/** WH3081 Lux packet length in bytes. */
+#define WH3081_LUX_PAYLOAD 1
+
+/** WH3081 Lux uv index. */
+#define WH3081_LUX_UV(b) \
+    (b[WH3081_LUX_PAYLOAD+1] & 0x0F)
+
+/** WH3081 Lux illuminance. */
+#define WH3081_LUX_ILLUM(b) \
+    (((b[WH3081_LUX_PAYLOAD+3] << 16) | (b[WH3081_LUX_PAYLOAD+4] << 8)  | b[WH3081_LUX_PAYLOAD+5]) * 0.1f)
+
+static int wh3081_lux_callback(uint8_t bb[BITBUF_ROWS][BITBUF_COLS]) {
+    unsigned int i = 0;
+    uint8_t packet[WH3081_LUX_PACKET_LENGTH] = { 0x0 };
+    uint64_t epoch;
+
+    for (i = 0; i < sizeof(packet); i++) {
+        packet[i] = ~bb[0][i];
+    }
+
+    epoch = (uint64_t)time(NULL);
+
+    /* Check preamble, 8 bits of 1's. */
+    if (packet[WH3081_PREAMBLE] != 0xFF) {
+        return 0;
+    }
+
+    /* Check postamble, 8 bits of 1's. */
+    if (packet[WH3081_LUX_POSTAMBLE] != 0xFF) {
+        return 0;
+    }
+
+    if (crc8(&packet[WH3081_LUX_PAYLOAD], WH3081_LUX_PAYLOAD_LENGTH) != 0x00) {
+        return 0;
+    }
+
+    /* Check message type is correct, 0x07. */
+    if (WH3081_MESSAGE_TYPE(packet) != 0x07) {
+        return 0;
+    }
+
+    fprintf(stderr, "CRC OK: %"PRIu64"\n", epoch);
+
+    for (i = 0; i < WH3081_LUX_PACKET_LENGTH; i++) {
+        fprintf(stderr, "0x%02X ", packet[i]);
+    }
+    fprintf(stderr, "\n");
+
+    fprintf(stderr, "   Message Type: 0x%02X\n", WH3081_MESSAGE_TYPE(packet));
+    fprintf(stderr, "   UV Index: %u\n", WH3081_LUX_UV(packet));
+    fprintf(stderr, "   Illuminance: %.1f\n", WH3081_LUX_ILLUM(packet));
+
+    return 1;
+}
 
 uint16_t AD_POP(uint8_t bb[BITBUF_COLS], uint8_t bits, uint8_t bit) {
     uint16_t val = 0;
@@ -398,6 +604,7 @@ r_device rubicson = {
     /* .short_limit    = */ 1744/4,
     /* .long_limit     = */ 3500/4,
     /* .reset_limit    = */ 5000/4,
+    /* .sync_bit       = */ true,
     /* .json_callback  = */ &rubicson_callback,
 };
 
@@ -408,6 +615,7 @@ r_device prologue = {
     /* .short_limit    = */ 3500/4,
     /* .long_limit     = */ 7000/4,
     /* .reset_limit    = */ 15000/4,
+    /* .sync_bit       = */ true,
     /* .json_callback  = */ &prologue_callback,
 };
 
@@ -418,6 +626,7 @@ r_device silvercrest = {
     /* .short_limit    = */ 600/4,
     /* .long_limit     = */ 5000/4,
     /* .reset_limit    = */ 15000/4,
+    /* .sync_bit       = */ true,
     /* .json_callback  = */ &silvercrest_callback,
 };
 
@@ -428,7 +637,9 @@ r_device tech_line_fws_500 = {
     /* .short_limit    = */ 3500/4,
     /* .long_limit     = */ 7000/4,
     /* .reset_limit    = */ 15000/4,
+    /* .sync_bit       = */ true,
     // /* .json_callback  = */ &rubicson_callback,
+                            NULL
 };
 
 r_device generic_hx2262 = {
@@ -438,7 +649,9 @@ r_device generic_hx2262 = {
     /* .short_limit    = */ 1300/4,
     /* .long_limit     = */ 10000/4,
     /* .reset_limit    = */ 40000/4,
+    /* .sync_bit       = */ true,
     // /* .json_callback  = */ &silvercrest_callback,
+                            NULL
 };
 
 r_device technoline_ws9118 = {
@@ -448,6 +661,7 @@ r_device technoline_ws9118 = {
     /* .short_limit    = */ 1800/4,
     /* .long_limit     = */ 3500/4,
     /* .reset_limit    = */ 15000/4,
+    /* .sync_bit       = */ true,
     /* .json_callback  = */ &debug_callback,
 };
 
@@ -459,6 +673,7 @@ r_device elv_em1000 = {
     /*.short_limit    = */ 750/4,
     /* .long_limit     = */ 7250/4,
     /* .reset_limit    = */ 30000/4,
+    /* .sync_bit       = */ true,
     /* .json_callback  = */ &em1000_callback,
 };
 
@@ -469,6 +684,7 @@ r_device elv_ws2000 = {
     /*.short_limit    = */ (602+(1155-602)/2)/4,
     /* .long_limit     = */ ((1755635-1655517)/2)/4, // no repetitions
     /* .reset_limit    = */ ((1755635-1655517)*2)/4,
+    /* .sync_bit       = */ true,
     /* .json_callback  = */ &ws2000_callback,
 };
 
@@ -479,7 +695,30 @@ r_device waveman = {
     /*.short_limit    = */ 1000/4,
     /* .long_limit     = */ 8000/4,
     /* .reset_limit    = */ 30000/4,
+    /* .sync_bit       = */ true,
     /* .json_callback  = */ &waveman_callback,
+};
+
+r_device wh3081 = {
+    /*.id             = */ 7,
+    /*.name           = */ "Fine Offset WH3081 Weather Station Climate",
+    /*.modulation     = */ OOK_PWM_P,
+    /*.short_limit    = */ 246,
+    /* .long_limit     = */ 35000,
+    /* .reset_limit    = */ 50000,
+    /* .sync_bit       = */ false,
+    /* .json_callback  = */ &wh3081_callback,
+};
+
+r_device wh3081_lux = {
+    /*.id             = */ 8,
+    /*.name           = */ "Fine Offset WH3081 Weather Station Lux",
+    /*.modulation     = */ OOK_PWM_P,
+    /*.short_limit    = */ 246,
+    /* .long_limit     = */ 35000,
+    /* .reset_limit    = */ 50000,
+    /* .sync_bit       = */ false,
+    /* .json_callback  = */ &wh3081_lux_callback,
 };
 
 
@@ -506,6 +745,7 @@ struct protocol_state {
     int pulse_start;
     int real_bits;
     int start_bit;
+    bool sync_bit;
     /* pwm limits */
     int short_limit;
     int long_limit;
@@ -576,6 +816,7 @@ sighandler(int signum)
 #else
 static void sighandler(int signum)
 {
+    (void)signum;
     fprintf(stderr, "Signal caught, exiting!\n");
     do_exit = 1;
     rtlsdr_cancel_async(dev);
@@ -675,6 +916,7 @@ static void register_protocol(struct dm_state *demod, r_device *t_dev) {
     p->long_limit   = (float)t_dev->long_limit /((float)DEFAULT_SAMPLE_RATE/(float)samp_rate);
     p->reset_limit  = (float)t_dev->reset_limit/((float)DEFAULT_SAMPLE_RATE/(float)samp_rate);
     p->modulation   = t_dev->modulation;
+    p->sync_bit     = t_dev->sync_bit;
     p->callback     = t_dev->json_callback;
     demod_reset_bits_packet(p);
 
@@ -767,10 +1009,10 @@ static void classify_signal() {
     /* 50% decision limit */
     if (max/min > 1) {
         fprintf(stderr, "Pulse coding: Short pulse length %d - Long pulse length %d\n", min, max);
-        signal_type = 2;
+        signal_type = OOK_PWM_P;
     } else {
         fprintf(stderr, "Distance coding: Pulse length %d\n", (min+max)/2);
-        signal_type = 1;
+        signal_type = OOK_PWM_D;
     }
     p_limit = (max+min)/2;
 
@@ -870,7 +1112,7 @@ static void classify_signal() {
     fprintf(stderr, "\np_limit: %d\n",p_limit);
 
     demod_reset_bits_packet(&p);
-    if (signal_type == 1) {
+    if (signal_type == OOK_PWM_D) {
         for(i=0 ; i<1000 ; i++){
             if (signal_distance_data[i] > 0) {
                 if (signal_distance_data[i] < (a[0]+a[1])/2) {
@@ -889,7 +1131,7 @@ static void classify_signal() {
         }
         demod_print_bits_packet(&p);
     }
-    if (signal_type == 2) {
+    if (signal_type == OOK_PWM_P) {
         for(i=0 ; i<1000 ; i++){
             if(signal_pulse_data[i][2] > 0) {
                 if (signal_pulse_data[i][2] < p_limit) {
@@ -1067,8 +1309,8 @@ static void pwm_d_decode(struct dm_state *demod, struct protocol_state* p, int16
     }
 }
 
-/* The length of pulses decodes into bits */
 
+/* The length of pulses decodes into bits */
 static void pwm_p_decode(struct dm_state *demod, struct protocol_state* p, int16_t *buf, uint32_t len) {
     unsigned int i;
 
@@ -1078,6 +1320,8 @@ static void pwm_p_decode(struct dm_state *demod, struct protocol_state* p, int16
             p->start_bit      = 1;
             p->start_c        = 1;
             p->sample_counter = 0;
+            if (!p->sync_bit)
+                p->real_bits = 1;
 //            fprintf(stderr, "start bit pulse start detected\n");
         }
 
@@ -1104,9 +1348,9 @@ static void pwm_p_decode(struct dm_state *demod, struct protocol_state* p, int16
 //           fprintf(stderr, "space duration %d\n", p->sample_counter);
 
             if (p->pulse_length <= p->short_limit) {
-                demod_add_bit(p, 1);
-            } else if (p->pulse_length > p->short_limit) {
                 demod_add_bit(p, 0);
+            } else if (p->pulse_length > p->short_limit) {
+                demod_add_bit(p, 1);
             }
             p->sample_counter = 0;
             p->pulse_start    = 0;
@@ -1337,14 +1581,16 @@ int main(int argc, char **argv)
     }
 
     /* init protocols somewhat ok */
-    register_protocol(demod, &rubicson);
-    register_protocol(demod, &prologue);
-    register_protocol(demod, &silvercrest);
-//    register_protocol(demod, &generic_hx2262);
-//    register_protocol(demod, &technoline_ws9118);
-    register_protocol(demod, &elv_em1000);
-    register_protocol(demod, &elv_ws2000);
-    register_protocol(demod, &waveman);
+    //register_protocol(demod, &rubicson);
+    //register_protocol(demod, &prologue);
+    //register_protocol(demod, &silvercrest);
+    //register_protocol(demod, &generic_hx2262);
+    //register_protocol(demod, &technoline_ws9118);
+    //register_protocol(demod, &elv_em1000);
+    //register_protocol(demod, &elv_ws2000);
+    //register_protocol(demod, &waveman);
+    register_protocol(demod, &wh3081);
+    register_protocol(demod, &wh3081_lux);
 
     if (argc <= optind-1) {
         usage();
